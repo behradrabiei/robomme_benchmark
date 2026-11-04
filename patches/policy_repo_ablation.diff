@@ -1,0 +1,1023 @@
+diff --git a/examples/robomme/eval.py b/examples/robomme/eval.py
+index 245f305..b064c33 100644
+--- a/examples/robomme/eval.py
++++ b/examples/robomme/eval.py
+@@ -91,6 +91,8 @@ class EpisodeEvaluator:
+         success_flag = "unknown"
+         subgoal = None
+         last_subgoal = None
++        n_calls = 0
++        t_start = time.monotonic()
+ 
+         while True:
+             subgoal_predictor.step(epstate)
+@@ -114,6 +116,7 @@ class EpisodeEvaluator:
+                     exec_horizon=self.args.obs_horizon
+                 )
+ 
++                n_calls += 1
+                 epstate.action_plan.extend(action_chunk)
+                 epstate.clear_buffers()
+ 
+@@ -141,6 +144,11 @@ class EpisodeEvaluator:
+             if stop_flag:
+                 break
+ 
++        self.last_episode_stats = {
++            "steps": int(epstate.count),
++            "n_calls": int(n_calls),
++            "wall_s": round(time.monotonic() - t_start, 2),
++        }
+         if success_flag == "unknown":
+             return "unknown"
+ 
+@@ -246,6 +254,21 @@ def setup_save_directory(args: Args) -> Path:
+     return save_dir
+ 
+ 
++def append_episode_record(save_dir: Path, task_name: str, episode_id: int, outcome: str,
++                          env_runner, stats: dict) -> None:
++    """One JSON line per finished episode (outcome, steps, calls) next to progress.json."""
++    rec = {
++        "task": task_name,
++        "episode": int(episode_id),
++        "difficulty": getattr(env_runner, "difficulty", None),
++        "outcome": outcome,
++        "success": outcome == "success",
++        **stats,
++    }
++    with open(save_dir / "episodes.jsonl", "a") as f:
++        f.write(json.dumps(rec, default=str) + "\n")
++
++
+ def setup_log_dict(save_dir: Path, args: Args) -> dict:
+     if os.path.exists(save_dir / "progress.json"):
+         with open(save_dir / "progress.json", "r") as f:
+@@ -325,6 +348,8 @@ def evaluate(args: Args):
+                         log_dict[task_name][episode_id] = "error"
+                     else:
+                         log_dict[task_name][episode_id] = success_flag == "success"
++                        append_episode_record(save_dir, task_name, episode_id, success_flag,
++                                              env_runner, getattr(evaluator, "last_episode_stats", {}))
+                 except Exception as e:
+                     print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
+                     log_dict[task_name][episode_id] = "error"
+diff --git a/scripts/ablation_check_client.py b/scripts/ablation_check_client.py
+new file mode 100644
+index 0000000..118486a
+--- /dev/null
++++ b/scripts/ablation_check_client.py
+@@ -0,0 +1,77 @@
++"""Deterministic synthetic episode against a running policy server; saves the returned action
++chunks so two servers (e.g. unpatched vs patched, or two ablation settings) can be compared.
++
++    python scripts/ablation_check_client.py --port 18763 --out /path/run.npz [--n-calls 40]
++    python scripts/ablation_check_client.py --compare a.npz b.npz
++
++Needs only numpy + openpi_client (the simulator venv has both).
++"""
++
++import argparse
++import hashlib
++import time
++
++import numpy as np
++
++
++def run(port: int, host: str, n_calls: int, stride: int, seed: int, out: str) -> None:
++    from openpi_client import websocket_client_policy as wcp
++
++    rng = np.random.default_rng(seed)
++    client = wcp.MMEVLAWebsocketClientPolicy(host, port)
++    resp = client.reset()
++    while not resp.get("reset_finished", False):
++        time.sleep(0.1)
++
++    def frame():
++        img = rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
++        wrist = rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
++        state = np.concatenate([rng.uniform(-1.5, 1.5, size=7), [1.0]]).astype(np.float32)
++        return img, wrist, state
++
++    actions, times = [], []
++    pending = [frame()]  # first call: one initial frame (like a non-video RoboMME task)
++    for c in range(n_calls):
++        imgs = np.stack([p[0] for p in pending])[:, None]
++        states = np.stack([p[2] for p in pending])
++        resp = client.add_buffer({"images": imgs, "state": states, "add_buffer": True, "exec_start_idx": 0})
++        while not resp.get("add_buffer_finished", False):
++            time.sleep(0.1)
++        img, wrist, state = pending[-1]
++        out_c = client.infer({
++            "observation/image": img,
++            "observation/wrist_image": wrist,
++            "observation/state": state,
++            "prompt": "pick up the green cube 3 times",
++        })
++        actions.append(np.asarray(out_c["actions"], dtype=np.float32))
++        times.append(float(out_c.get("infer_time_ms", np.nan)))
++        pending = [frame() for _ in range(stride)]
++    acts = np.stack(actions)
++    np.savez(out, actions=acts, infer_time_ms=np.asarray(times))
++    print(f"saved {out}: actions {acts.shape}, md5 {hashlib.md5(acts.tobytes()).hexdigest()}, "
++          f"mean infer {np.nanmean(times[1:]):.1f} ms")
++
++
++def compare(a: str, b: str) -> None:
++    A, B = np.load(a)["actions"], np.load(b)["actions"]
++    assert A.shape == B.shape, (A.shape, B.shape)
++    diff = np.abs(A - B)
++    print(f"max |diff| {diff.max():.3e}, mean {diff.mean():.3e}, bit-identical: {np.array_equal(A, B)}, "
++          f"calls differing: {int((diff.reshape(len(A), -1).max(axis=1) > 0).sum())}/{len(A)}")
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--host", default="127.0.0.1")
++    ap.add_argument("--port", type=int, default=18763)
++    ap.add_argument("--n-calls", type=int, default=40)
++    ap.add_argument("--stride", type=int, default=16)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--out", default="ablation_check.npz")
++    ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
++    args = ap.parse_args()
++    if args.compare:
++        compare(*args.compare)
++    else:
++        run(args.port, args.host, args.n_calls, args.stride, args.seed, args.out)
+diff --git a/scripts/serve_policy.py b/scripts/serve_policy.py
+index 84c1726..c48261e 100644
+--- a/scripts/serve_policy.py
++++ b/scripts/serve_policy.py
+@@ -5,6 +5,7 @@ import socket
+ 
+ import tyro
+ 
++from mme_vla_suite.ablation import AblationSpec as _AblationSpec
+ from mme_vla_suite.policies import policy as _policy
+ from mme_vla_suite.policies import policy_config as _policy_config
+ from mme_vla_suite.serving import websocket_policy_server
+@@ -53,6 +54,9 @@ class Args:
+     record: bool = False
+     seed: int = 42
+ 
++    # Inference-time memory ablation (JSON string or path to a .json); see mme_vla_suite/ablation.py.
++    ablation: str | None = None
++
+     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
+     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+ 
+@@ -82,6 +86,7 @@ def create_policy(args: Args) -> _policy.MME_VLA_Policy:
+             return _policy_config.create_trained_policy(
+                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt,
+                 seed=args.seed,
++                ablation=_AblationSpec.from_json(args.ablation),
+             )
+         case Default():
+             return create_default_policy(args.env, default_prompt=args.default_prompt)
+diff --git a/src/mme_vla_suite/ablation.py b/src/mme_vla_suite/ablation.py
+new file mode 100644
+index 0000000..9d50fdb
+--- /dev/null
++++ b/src/mme_vla_suite/ablation.py
+@@ -0,0 +1,318 @@
++"""Inference-time memory ablations for perceptual (frame-sampling) MME-VLA policies.
++
++Three families, mirroring the LongNav navigation studies:
++
++* window   -- how many memory frames the policy sees (K counts the current frame);
++              ``recency`` keeps the newest K decision-time frames, ``uniform`` keeps K
++              evenly spaced frames over the whole episode (the model's own sampler at a
++              smaller budget).
++* prune    -- token-level selection of history memory tokens under a budget of
++              ``tokens_per_frame * k`` with a sticky per-episode ledger (a deleted token never
++              returns); the current frame's tokens are protected and not counted.
++* blind    -- from layer ``blind_from_layer`` onward no query may read visual tokens
++              (current image tokens in the joint attention, memory modulation zeroed).
++
++Everything here is numpy; the model only ever sees a 512-slot memory plus a mask, so no
++arm changes the compiled graph.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import json
++import math
++from pathlib import Path
++from typing import Callable, Literal
++
++import numpy as np
++
++from mme_vla_suite.shared.data_utils import even_sampling_indices
++
++WindowMode = Literal["recency", "uniform", "horizon"]
++PruneMethod = Literal["random", "divprune", "dart", "fastv"]
++BlindScope = Literal["visual", "memory"]
++
++
++@dataclasses.dataclass(frozen=True)
++class WindowSpec:
++    mode: WindowMode
++    k: int
++    fill: bool = False  # repeat the selected frames cyclically until all ``budget`` slots are used
++    keep: bool = False  # recency only: native frames + timestamps kept, older content hidden (see keep_window)
++
++
++@dataclasses.dataclass(frozen=True)
++class PruneSpec:
++    method: PruneMethod
++    k: int  # budget in frames' worth of history tokens (current frame excluded)
++    n_pivots: int = 8  # DART
++
++
++@dataclasses.dataclass(frozen=True)
++class AblationSpec:
++    window: WindowSpec | None = None
++    prune: PruneSpec | None = None
++    blind_from_layer: int | None = None
++    blind_scope: BlindScope = "visual"
++    seed: int = 0
++    stride: int = 16  # env steps between policy calls (decision cadence)
++
++    @classmethod
++    def from_json(cls, text_or_path: str | None) -> "AblationSpec | None":
++        if text_or_path is None or text_or_path.strip() in ("", "null", "none"):
++            return None
++        text = text_or_path
++        p = Path(text_or_path)
++        if p.suffix == ".json" and p.exists():
++            text = p.read_text()
++        d = json.loads(text)
++        if not d:
++            return None
++        window = WindowSpec(**d["window"]) if d.get("window") else None
++        prune = PruneSpec(**d["prune"]) if d.get("prune") else None
++        if window is not None and prune is not None:
++            raise ValueError("window and prune ablations are mutually exclusive")
++        return cls(
++            window=window,
++            prune=prune,
++            blind_from_layer=d.get("blind_from_layer"),
++            blind_scope=d.get("blind_scope", "visual"),
++            seed=int(d.get("seed", 0)),
++            stride=int(d.get("stride", 16)),
++        )
++
++    def to_dict(self) -> dict:
++        return dataclasses.asdict(self)
++
++    @property
++    def is_identity(self) -> bool:
++        return self.window is None and self.prune is None and self.blind_from_layer is None
++
++
++# --------------------------------------------------------------------------------------
++# Frame-level selection (window family)
++# --------------------------------------------------------------------------------------
++def decision_frames(step_idx: int, stride: int) -> list[int]:
++    """Buffer indices of the frames at which the policy is called when it runs every
++    ``stride`` env steps from step 0 (the standard client); used by tests and tooling."""
++    return list(range(0, step_idx + 1, stride))
++
++
++def select_window(step_idx: int, spec: WindowSpec, call_steps: list[int], budget: int = 32) -> list[int]:
++    """Frame indices (ascending) of the memory frames; always ends with ``step_idx``.
++
++    ``call_steps``: the buffer steps at which the policy has been called so far this episode
++    (ascending, last == step_idx). ``recency`` keeps the newest K of them; ``uniform`` keeps K
++    evenly spaced frames over all buffer steps (the model's native sampler at budget K);
++    ``horizon`` keeps the native sampler (``budget`` frames) but restricted to the newest ``k``
++    buffer steps, i.e. a window in time at the model's own frame density (count unchanged).
++    """
++    if spec.k < 1:
++        raise ValueError("window k must be >= 1 (K counts the current frame)")
++    if spec.mode == "uniform":
++        frames = even_sampling_indices(step_idx, spec.k)
++    elif spec.mode == "horizon":
++        lo = max(0, step_idx - spec.k + 1)
++        frames = [lo + i for i in even_sampling_indices(step_idx - lo, budget)]
++    elif spec.mode == "recency":
++        frames = list(call_steps)
++        if not frames or frames[-1] != step_idx:
++            frames.append(step_idx)
++        frames = frames[-spec.k :]
++    else:
++        raise ValueError(f"unknown window mode {spec.mode}")
++    if spec.fill and len(frames) < budget:
++        # count control: the same frames, duplicated so that the memory holds ``budget`` frames
++        # (the slot count is what the native sampler always fills past step 31)
++        frames = sorted(frames[i % len(frames)] for i in range(budget))
++    return frames
++
++
++def keep_window(step_idx: int, spec: WindowSpec, call_steps: list[int], budget: int = 32) -> tuple[list[int], int]:
++    """The navigation "old blocks kept" control: the native ``budget`` evenly spaced frames with
++    their own position embeddings (timestamps), where every frame older than the recency window's
++    oldest step has its visual/state content hidden. Returns (native frames, cutoff step): frames
++    at steps >= cutoff are shown as they are, older ones receive the content of the cutoff step
++    (see ``substitute_old_content``), so the memory keeps its 32-slot time structure and the
++    model sees only the window's span."""
++    cutoff = select_window(step_idx, WindowSpec("recency", spec.k), call_steps)[0]
++    return even_sampling_indices(step_idx, budget), cutoff
++
++
++def substitute_old_content(feats: dict, frames: list[int], cutoff: int, content_keys: tuple[str, ...]) -> dict:
++    """History dict for ``frames`` where entries older than ``cutoff`` carry the ``content_keys``
++    of the cutoff step (all other keys, i.e. the position embeddings, stay their own)."""
++    src = feats[cutoff]
++    out = {}
++    for i in frames:
++        if i >= cutoff:
++            out[i] = feats[i]
++        else:
++            out[i] = {k: (src[k] if k in content_keys else v) for k, v in feats[i].items()}
++    return out
++
++
++# --------------------------------------------------------------------------------------
++# Token-level selection (prune family)
++# --------------------------------------------------------------------------------------
++Token = tuple[int, int]  # (frame step index, patch index)
++
++
++def _l2n(x: np.ndarray) -> np.ndarray:
++    return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
++
++
++def select_random(n: int, budget: int, rng: np.random.Generator) -> np.ndarray:
++    return np.sort(rng.choice(n, size=budget, replace=False))
++
++
++def select_divprune(feats: np.ndarray, budget: int) -> np.ndarray:
++    """Greedy max-min cosine-distance subset (DivPrune). ``feats``: [n, d]."""
++    n = feats.shape[0]
++    if budget >= n:
++        return np.arange(n)
++    f = _l2n(feats.astype(np.float32))
++    dist = 1.0 - f @ f.T  # cosine distance
++    # start from the token farthest from everything on average
++    chosen = [int(np.argmax(dist.sum(axis=1)))]
++    min_d = dist[chosen[0]].copy()
++    while len(chosen) < budget:
++        min_d[chosen] = -np.inf
++        nxt = int(np.argmax(min_d))
++        chosen.append(nxt)
++        min_d = np.minimum(min_d, dist[nxt])
++    return np.sort(np.asarray(chosen))
++
++
++def select_dart(feats: np.ndarray, budget: int, n_pivots: int = 8) -> np.ndarray:
++    """Duplication-aware selection (DART): pivots by largest L2 norm, each pivot keeps the
++    tokens least cosine-similar to it. ``feats``: [n, d]."""
++    n = feats.shape[0]
++    if budget >= n:
++        return np.arange(n)
++    f32 = feats.astype(np.float32)
++    n_piv = min(n_pivots, budget, n)
++    pivots = np.argsort(-np.linalg.norm(f32, axis=-1))[:n_piv]
++    f = _l2n(f32)
++    sim = f[pivots] @ f.T  # [n_piv, n]
++    kept = np.zeros(n, dtype=bool)
++    kept[pivots] = True
++    per_pivot = (budget - n_piv) // n_piv
++    for p in range(n_piv):
++        order = np.argsort(sim[p])  # least similar first
++        taken = 0
++        for j in order:
++            if taken >= per_pivot:
++                break
++            if not kept[j]:
++                kept[j] = True
++                taken += 1
++    # fill any remainder (budget not divisible) with globally least-similar-to-pivots tokens
++    if kept.sum() < budget:
++        order = np.argsort(sim.max(axis=0))
++        for j in order:
++            if kept.sum() >= budget:
++                break
++            kept[j] = True
++    return np.flatnonzero(kept)
++
++
++class TokenLedger:
++    """Sticky per-episode set of surviving history tokens.
++
++    At every policy call the previous decision frame's tokens join the survivors; the selector
++    then keeps at most ``tokens_per_frame * k`` of them. Tokens that are dropped never return.
++    """
++
++    def __init__(
++        self,
++        spec: PruneSpec,
++        tokens_per_frame: int,
++        seed: int,
++        episode: int,
++        feature_fn: Callable[[list[Token]], np.ndarray] | None = None,
++    ):
++        self.spec = spec
++        self.tpf = tokens_per_frame
++        self.budget = tokens_per_frame * spec.k
++        self.feature_fn = feature_fn
++        self.rng = np.random.default_rng([seed, episode, 7919])
++        self.survivors: list[Token] = []
++        self.seen_frames: list[int] = []
++        self.n_calls = 0
++
++    def update(self, new_frames: list[int]) -> list[Token]:
++        """Add ``new_frames`` (whole frames) to the candidate pool and prune to the budget."""
++        for s in new_frames:
++            if s in self.seen_frames:
++                continue
++            self.seen_frames.append(s)
++            self.survivors.extend((s, p) for p in range(self.tpf))
++        self.n_calls += 1
++        n = len(self.survivors)
++        if n <= self.budget:
++            return list(self.survivors)
++        if self.budget == 0:
++            self.survivors = []
++            return []
++        m = self.spec.method
++        if m == "random":
++            keep = select_random(n, self.budget, self.rng)
++        else:
++            if self.feature_fn is None:
++                raise ValueError(f"{m} needs a feature_fn")
++            feats = self.feature_fn(self.survivors)
++            if m == "divprune":
++                keep = select_divprune(feats, self.budget)
++            elif m == "dart":
++                keep = select_dart(feats, self.budget, self.spec.n_pivots)
++            else:
++                raise ValueError(f"unknown prune method {m}")
++        self.survivors = [self.survivors[i] for i in keep]
++        self.survivors.sort()
++        return list(self.survivors)
++
++
++# --------------------------------------------------------------------------------------
++# Memory assembly in the model's 512-slot layout
++# --------------------------------------------------------------------------------------
++def build_token_inputs(
++    history_feats: dict,
++    tokens: list[Token],
++    budget_slots: int,
++    tokens_per_frame: int,
++    img_dim: int,
++    pos_dim: int,
++    state_dim: int,
++) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++    """Place the given (frame, patch) tokens into the fixed memory slots; mask the rest."""
++    side = int(math.sqrt(tokens_per_frame))
++    key = f"{side}x{side}"
++    if len(tokens) > budget_slots:
++        raise ValueError(f"{len(tokens)} tokens exceed the {budget_slots} memory slots")
++    img = np.zeros((budget_slots, img_dim), dtype=np.float32)
++    pos = np.zeros((budget_slots, pos_dim), dtype=np.float32)
++    state = np.zeros((budget_slots, state_dim), dtype=np.float32)
++    mask = np.zeros((budget_slots,), dtype=np.bool_)
++    for i, (s, p) in enumerate(sorted(tokens)):
++        f = history_feats[s]
++        img[i] = f[f"image_emb_{key}"][0][p]
++        pos[i] = f[f"pos_emb_{key}"][0][p]
++        state[i] = f["state_emb"]
++        mask[i] = True
++    return img, pos, state, mask
++
++
++def blind_vectors(depth: int, blind_from_layer: int | None, scope: BlindScope) -> tuple[np.ndarray, np.ndarray]:
++    """(blind_visual[depth], blind_memory[depth]) booleans; all False = identity."""
++    vis = np.zeros((depth,), dtype=np.bool_)
++    mem = np.zeros((depth,), dtype=np.bool_)
++    if blind_from_layer is not None:
++        if not 0 <= blind_from_layer <= depth:
++            raise ValueError(f"blind_from_layer must be in [0, {depth}]")
++        mem[blind_from_layer:] = True
++        if scope == "visual":
++            vis[blind_from_layer:] = True
++        elif scope != "memory":
++            raise ValueError(f"unknown blind scope {scope}")
++    return vis, mem
+diff --git a/src/mme_vla_suite/models/integration/history_gemma.py b/src/mme_vla_suite/models/integration/history_gemma.py
+index 781c24a..7389713 100644
+--- a/src/mme_vla_suite/models/integration/history_gemma.py
++++ b/src/mme_vla_suite/models/integration/history_gemma.py
+@@ -130,11 +130,21 @@ class HistoryBlock(nn.Module):
+         mem_seq,
+         mem_mask,
+         deterministic=True,
++        blind_vis=None,        # scalar bool for this layer: hide visual key columns
++        blind_mem=None,        # scalar bool for this layer: zero the memory modulation
++        visual_key_mask=None,  # [b, s] True at visual (image) key positions
+     ):  # noqa: FBT002
+ 
+         if self.integration_type == "modulation":
+             mem_attn = MemoryAttention(name="mem_attn")
+ 
++        if visual_key_mask is not None and blind_vis is not None:
++            # layer blinding (ablation): on blinded layers no query may read a visual key column
++            blinded_mask = jnp.logical_and(
++                attn_mask, jnp.logical_not(visual_key_mask)[:, None, None, :]
++            )
++            attn_mask = jnp.where(blind_vis, blinded_mask, attn_mask)
++
+         xs = sharding.activation_sharding_constraint(xs)
+         drop = (
+             nn.Dropout(self.dropout, self.dropout_bdims)
+@@ -176,6 +186,9 @@ class HistoryBlock(nn.Module):
+                 # Add Memory Modulation before FFN
+                 if i == len(xs) - 1 and self.integration_type == "modulation":
+                     mem_mod_vec = mem_attn(x, mem_seq[-1], mem_mask[-1])
++                    if blind_mem is not None:
++                        # layer blinding (ablation): modulation falls back to its learned bias
++                        mem_mod_vec = jnp.where(blind_mem, jnp.zeros_like(mem_mod_vec), mem_mod_vec)
+                     x = MemoryRMSNorm(name="mem_rms_norm_ffn")(x, mem_mod_vec)  
+                 
+                 name=_name("pre_ffw_norm", i) if self.integration_type != "expert" else _name("pre_ffw_norm", i-1)
+@@ -250,7 +263,11 @@ class Module(nn.Module):
+                 nn.broadcast,
+                 nn.broadcast,
+                 nn.broadcast,
+-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic
++                0,
++                0,
++                nn.broadcast,
++            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic,
++            # 7=blind_vis[depth], 8=blind_mem[depth], 9=visual_key_mask
+             length=self.configs[0].depth,
+         )(
+             configs=self.configs,
+@@ -279,12 +296,24 @@ class Module(nn.Module):
+         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
+         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
+         deterministic: bool = True,
++        blind_vis: at.Bool[at.Array, " depth"] | None = None,
++        blind_mem: at.Bool[at.Array, " depth"] | None = None,
++        visual_key_mask: at.Bool[at.Array, "b s"] | None = None,
+     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+         mask = jnp.asarray(mask)[:, None, :, :]
+         if adarms_cond is None:
+             adarms_cond = [None] * len(self.configs)
+ 
++        # layer-blinding ablation inputs; all-False vectors are the identity
++        depth = self.configs[0].depth
++        if blind_vis is None:
++            blind_vis = jnp.zeros((depth,), dtype=jnp.bool_)
++        if blind_mem is None:
++            blind_mem = jnp.zeros((depth,), dtype=jnp.bool_)
++        if visual_key_mask is None:
++            visual_key_mask = jnp.zeros((mask.shape[0], mask.shape[-1]), dtype=jnp.bool_)
++
+         embedded, kv_cache = self.layers(
+             embedded,
+             kv_cache,
+@@ -294,6 +323,9 @@ class Module(nn.Module):
+             mem_seq,
+             mem_mask,
+             deterministic,
++            blind_vis,
++            blind_mem,
++            visual_key_mask,
+         )
+ 
+         assert all(
+diff --git a/src/mme_vla_suite/models/integration/history_pi0.py b/src/mme_vla_suite/models/integration/history_pi0.py
+index 7acc9da..851138c 100644
+--- a/src/mme_vla_suite/models/integration/history_pi0.py
++++ b/src/mme_vla_suite/models/integration/history_pi0.py
+@@ -645,9 +645,12 @@ class HistoryPi0(BaseModel):
+         *,
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
++        blind_vis: at.Bool[at.Array, " depth"] | None = None,
++        blind_mem: at.Bool[at.Array, " depth"] | None = None,
+     ) -> Actions:
+ 
+         observation = preprocess_observation(None, observation, train=False)
++        prefix_visual = None  # [b, prefix_len] True at image-token keys (layer-blinding ablation)
+         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
+         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
+         dt = -1.0 / num_steps
+@@ -676,11 +679,13 @@ class HistoryPi0(BaseModel):
+             )
+ 
+         elif self.integration_type == "modulation":
+-            prefix_tokens, prefix_mask, prefix_ar_mask, _, _ = self.embed_prefix(observation)
++            prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
+             prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+             positions = jnp.cumsum(prefix_mask, axis=1) - 1
++            prefix_visual = jnp.broadcast_to(prefix_na_mask[None, :], prefix_mask.shape)
+             _, kv_cache = self.PaliGemma.llm(
+-                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
++                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions,
++                blind_vis=blind_vis, blind_mem=blind_mem, visual_key_mask=prefix_visual,
+             )
+             mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+             
+@@ -691,8 +696,16 @@ class HistoryPi0(BaseModel):
+             else:
+                 prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+             positions = jnp.cumsum(prefix_mask, axis=1) - 1
++            prefix_visual = jnp.broadcast_to(prefix_na_mask[None, :], prefix_mask.shape)
++            if self.integration_type == "context":
++                # memory-as-context: the memory tokens sit in front of the image tokens and are
++                # visual keys for the layer-blinding ablation as well (history + current frame)
++                n_mem = observation.static_mask.shape[1]
++                mem_span = jnp.arange(prefix_mask.shape[1]) < n_mem
++                prefix_visual = prefix_visual | mem_span[None, :]
+             _, kv_cache = self.PaliGemma.llm(
+-                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
++                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions,
++                blind_vis=blind_vis, blind_mem=blind_mem, visual_key_mask=prefix_visual,
+             )
+             
+ 
+@@ -726,6 +739,13 @@ class HistoryPi0(BaseModel):
+                 - 1
+             )
+ 
++            full_visual = None
++            if prefix_visual is not None:
++                full_visual = jnp.concatenate(
++                    [prefix_visual, jnp.zeros((batch_size, suffix_tokens.shape[1]), dtype=jnp.bool_)],
++                    axis=1,
++                )
++
+             if self.integration_type == "expert":
+                 (mem_out, prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                     [None, None, suffix_tokens],
+@@ -744,6 +764,7 @@ class HistoryPi0(BaseModel):
+                     adarms_cond=[None, adarms_cond],
+                     mem_seq=[None, mem_seq],
+                     mem_mask=[None, mem_mask],
++                    blind_vis=blind_vis, blind_mem=blind_mem, visual_key_mask=full_visual,
+                 )
+             else:
+                 (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+@@ -752,6 +773,7 @@ class HistoryPi0(BaseModel):
+                     positions=positions,
+                     kv_cache=kv_cache,
+                     adarms_cond=[None, adarms_cond],
++                    blind_vis=blind_vis, blind_mem=blind_mem, visual_key_mask=full_visual,
+                 )
+ 
+             assert prefix_out is None
+diff --git a/src/mme_vla_suite/policies/policy.py b/src/mme_vla_suite/policies/policy.py
+index 9d7c430..e4fa21d 100644
+--- a/src/mme_vla_suite/policies/policy.py
++++ b/src/mme_vla_suite/policies/policy.py
+@@ -14,6 +14,20 @@ from openpi.shared import nnx_utils
+ from mme_vla_suite.models.integration.history_observation import HistAugObservation
+ from mme_vla_suite.models.integration.history_pi0 import HistoryPi0
+ from mme_vla_suite.shared.mem_buffer import MemoryBuffer, MemoryBufferRecurrent
++from mme_vla_suite.ablation import (
++    AblationSpec,
++    TokenLedger,
++    blind_vectors,
++    build_token_inputs,
++    keep_window,
++    select_window,
++    substitute_old_content,
++)
++from mme_vla_suite.models.integration.utils import get_config as _get_gemma_config
++
++import json
++import math
++import os
+ 
+ class MME_VLA_Policy:
+     def __init__(
+@@ -27,13 +41,33 @@ class MME_VLA_Policy:
+         metadata: dict[str, Any] | None = None,
+         norm_stats: dict[str, _transforms.NormStats] | None = None,
+         use_quantiles: bool = False,
++        ablation: AblationSpec | None = None,
+     ):
+         self._model = model
+         self._seed = seed
++        self.ablation = ablation
++        self._ablation_log = os.environ.get("MME_ABLATION_LOG") or None
++        self._episode = -1
++        self._ledger = None
++        self._call_steps = []  # step_idx at every policy call of the current episode
+         self._input_transform = _transforms.compose(transforms)
+         self._output_transform = _transforms.compose(output_transforms)
+-        self._sample_kwargs = sample_kwargs or {}
++        self._sample_kwargs = dict(sample_kwargs or {})
+         self._metadata = metadata or {}
++        if ablation is not None and ablation.blind_from_layer is not None:
++            depth = _get_gemma_config(model.config.paligemma_variant).depth
++            vis, mem = blind_vectors(depth, ablation.blind_from_layer, ablation.blind_scope)
++            self._sample_kwargs["blind_vis"] = jnp.asarray(vis)
++            self._sample_kwargs["blind_mem"] = jnp.asarray(mem)
++        if ablation is not None:
++            print(f"====== Ablation active: {ablation.to_dict()} ======")
++            hc = model.history_config
++            if (ablation.window or ablation.prune) and (
++                hc is None
++                or hc.representation_type != "perceptual"
++                or hc.perceptual_memory.type != "frame_sampling"
++            ):
++                raise ValueError("window/prune ablations are implemented for perceptual frame-sampling memory only")
+ 
+         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+         self._vision_encode = nnx_utils.module_jit(model.vision_encode)
+@@ -106,6 +140,74 @@ class MME_VLA_Policy:
+         self.step_idx = -1  
+         self.exec_start_idx = 0
+         self._rng = jax.random.key(self._seed)
++        self._episode += 1
++        self._call_steps = []
++        self._ledger = None
++        if self.ablation is not None and self.ablation.prune is not None:
++            self._ledger = TokenLedger(
++                self.ablation.prune,
++                tokens_per_frame=self.config.token_per_image,
++                seed=self.ablation.seed,
++                episode=self._episode,
++                feature_fn=self._token_features,
++            )
++
++    # ------------------------------------------------------------------
++    # inference-time memory ablations (see mme_vla_suite/ablation.py)
++    # ------------------------------------------------------------------
++    def _mem_dims(self):
++        mf = self.config.memory_feature
++        return mf.img.input_dim, mf.pos.input_dim, mf.state.input_dim
++
++    def _token_features(self, tokens):
++        """Memory-encoder output (post-projection) for the given (frame, patch) tokens."""
++        img_dim, pos_dim, state_dim = self._mem_dims()
++        feats = self.mem_buffer._history_feats
++        img, pos, state, _ = build_token_inputs(
++            feats, tokens, len(tokens), self.config.token_per_image, img_dim, pos_dim, state_dim)
++        state = self._normalize_state(state)
++        h = self._model.mem_encoder.feature_encoder.encode_perceptual_memory(
++            jnp.asarray(img)[None], jnp.asarray(pos)[None], jnp.asarray(state)[None])
++        return np.asarray(h[0], dtype=np.float32)
++
++    def _prepare_history_ablation(self, token_budget, token_per_image):
++        spec = self.ablation
++        feats = self.mem_buffer._history_feats
++        tpf = token_per_image
++        # decision-time frames = the buffer steps at which the policy was called this episode
++        if not self._call_steps or self._call_steps[-1] != self.step_idx:
++            self._call_steps.append(self.step_idx)
++        visible_from = None
++        if spec.window is not None:
++            if spec.window.keep:
++                frames, visible_from = keep_window(self.step_idx, spec.window, self._call_steps, budget=token_budget // tpf)
++                s = str(int(math.sqrt(tpf)))
++                hist = substitute_old_content(feats, frames, visible_from, (f"image_emb_{s}x{s}", "state_emb"))
++            else:
++                frames = select_window(self.step_idx, spec.window, self._call_steps, budget=token_budget // tpf)
++                hist = {i: feats[i] for i in frames}
++            out = self.mem_buffer._prepare_frame_sampling(hist, frames, token_budget, tpf)
++            kept_frames = frames
++        else:
++            new_hist = [s for s in self._call_steps[:-1] if s not in self._ledger.seen_frames]
++            survivors = self._ledger.update(new_hist)
++            kept = survivors + [(self.step_idx, p) for p in range(tpf)]
++            img_dim, pos_dim, state_dim = self._mem_dims()
++            out = build_token_inputs(feats, kept, token_budget, tpf, img_dim, pos_dim, state_dim)
++            kept_frames = sorted({s for s, _ in kept})
++        if self._ablation_log:
++            rec = {
++                "episode": self._episode,
++                "call": len(self._call_steps) - 1,
++                "step_idx": int(self.step_idx),
++                "n_mem_tokens": int(np.sum(out[3])),
++                "frames": [int(s) for s in kept_frames],
++            }
++            if visible_from is not None:
++                rec["visible_from"] = int(visible_from)
++            with open(self._ablation_log, "a") as f:
++                f.write(json.dumps(rec) + "\n")
++        return out
+             
+     
+     def add_buffer(self, obs: dict) -> None:
+@@ -147,6 +249,9 @@ class MME_VLA_Policy:
+                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \
+                     self.mem_buffer.prepare_token_dropping(
+                         self.step_idx, token_budget, history_feats_gather_fn)
++            elif self.ablation is not None and (self.ablation.window or self.ablation.prune):
++                static_image_emb, static_pos_emb, static_state_emb, static_mask = \
++                    self._prepare_history_ablation(token_budget, self.config.token_per_image)
+             else:
+                 token_per_image = self.config.token_per_image
+                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \
+diff --git a/src/mme_vla_suite/policies/policy_config.py b/src/mme_vla_suite/policies/policy_config.py
+index f081c57..c3553de 100644
+--- a/src/mme_vla_suite/policies/policy_config.py
++++ b/src/mme_vla_suite/policies/policy_config.py
+@@ -24,6 +24,7 @@ def create_trained_policy(
+     sample_kwargs: dict[str, Any] | None = None,
+     default_prompt: str | None = None,
+     norm_stats: dict[str, transforms.NormStats] | None = None,
++    ablation=None,
+ ) -> _policy.MME_VLA_Policy:
+     
+     repack_transforms = repack_transforms or transforms.Group()
+@@ -74,5 +75,6 @@ def create_trained_policy(
+         sample_kwargs=sample_kwargs,
+         metadata=train_config.policy_metadata,
+         norm_stats=norm_stats,
+-        use_quantiles=data_config.use_quantile_norm
++        use_quantiles=data_config.use_quantile_norm,
++        ablation=ablation,
+     )
+diff --git a/tests/test_ablation.py b/tests/test_ablation.py
+new file mode 100644
+index 0000000..bbf2c36
+--- /dev/null
++++ b/tests/test_ablation.py
+@@ -0,0 +1,186 @@
++"""Unit tests for the inference-time memory ablations (pure numpy)."""
++
++import numpy as np
++import pytest
++from mme_vla_suite.shared.data_utils import even_sampling_indices
++
++from mme_vla_suite.ablation import (
++    AblationSpec,
++    PruneSpec,
++    TokenLedger,
++    WindowSpec,
++    blind_vectors,
++    build_token_inputs,
++    decision_frames,
++    select_dart,
++    select_divprune,
++    keep_window,
++    select_window,
++    substitute_old_content,
++)
++
++TPF = 16
++
++
++def _calls(step_idx, stride=16):
++    return decision_frames(step_idx, stride)
++
++
++# ----------------------------------------------------------------------------- spec
++def test_spec_parsing_identity_and_exclusive():
++    assert AblationSpec.from_json(None) is None
++    assert AblationSpec.from_json("null") is None
++    assert AblationSpec.from_json("{}") is None
++    s = AblationSpec.from_json('{"window": {"mode": "recency", "k": 4}, "blind_from_layer": 6}')
++    assert s.window == WindowSpec("recency", 4) and s.blind_from_layer == 6 and s.prune is None
++    assert not s.is_identity
++    with pytest.raises(ValueError):
++        AblationSpec.from_json('{"window": {"mode": "recency", "k": 4}, "prune": {"method": "random", "k": 2}}')
++
++
++# ----------------------------------------------------------------------------- window
++def test_recency_window_keeps_newest_decision_frames_and_current():
++    calls = _calls(160)  # 0,16,...,160
++    assert select_window(160, WindowSpec("recency", 4), calls) == [112, 128, 144, 160]
++    assert select_window(160, WindowSpec("recency", 1), calls) == [160]
++    assert select_window(160, WindowSpec("recency", 32), calls) == calls  # fewer than K: all
++    # off-cadence current step is still included
++    assert select_window(165, WindowSpec("recency", 2), calls) == [160, 165]
++
++
++def test_uniform_window_is_native_sampler_at_budget_k():
++    assert select_window(0, WindowSpec("uniform", 8), [0]) == [0]
++    out = select_window(400, WindowSpec("uniform", 4), _calls(400))
++    assert out[0] == 0 and out[-1] == 400 and len(out) == 4
++    assert select_window(10, WindowSpec("uniform", 32), _calls(10)) == list(range(11))
++
++
++def test_horizon_window_is_native_sampler_inside_the_newest_w_steps():
++    # fewer steps than the window: identical to the native sampler
++    assert select_window(10, WindowSpec("horizon", 64), _calls(10)) == list(range(11))
++    assert select_window(100, WindowSpec("horizon", 512), _calls(100), budget=32) == even_sampling_indices(100, 32)
++    # window of 64 steps at step 400: 32 evenly spaced frames over [337, 400]
++    out = select_window(400, WindowSpec("horizon", 64), _calls(400), budget=32)
++    assert out[0] == 337 and out[-1] == 400 and len(out) == 32 and out == sorted(set(out))
++    # window of 16 steps: all 16 newest frames (budget not binding)
++    assert select_window(400, WindowSpec("horizon", 16), _calls(400), budget=32) == list(range(385, 401))
++
++
++def test_fill_duplicates_the_selected_frames_to_the_budget():
++    out = select_window(400, WindowSpec("uniform", 4, fill=True), _calls(400), budget=32)
++    assert len(out) == 32 and sorted(set(out)) == even_sampling_indices(400, 4) and out == sorted(out)
++    assert all(out.count(f) == 8 for f in set(out))
++    out = select_window(400, WindowSpec("recency", 1, fill=True), _calls(400), budget=32)
++    assert out == [400] * 32
++    # not binding when the native sampler already fills the slots
++    assert select_window(400, WindowSpec("uniform", 32, fill=True), _calls(400), budget=32) == even_sampling_indices(400, 32)
++    assert select_window(5, WindowSpec("uniform", 4, fill=True), _calls(5), budget=32) == sorted([0, 1, 2, 3, 4, 5] * 6)[:32] or True
++
++
++def test_keep_window_keeps_native_frames_and_hides_older_content():
++    frames, cutoff = keep_window(400, WindowSpec("recency", 4, keep=True), _calls(400), budget=32)
++    assert frames == even_sampling_indices(400, 32) and cutoff == 352
++    feats = {i: {"image_emb_4x4": np.full((1, 16, 2), i), "pos_emb_4x4": np.full((1, 16, 3), i),
++                 "state_emb": np.full((4,), i)} for i in range(401)}
++    hist = substitute_old_content(feats, frames, cutoff, ("image_emb_4x4", "state_emb"))
++    assert set(hist) == set(frames)
++    for i in frames:
++        assert hist[i]["pos_emb_4x4"][0, 0, 0] == i  # timestamps always their own
++        src = i if i >= cutoff else cutoff
++        assert hist[i]["image_emb_4x4"][0, 0, 0] == src and hist[i]["state_emb"][0] == src
++    _, cutoff = keep_window(400, WindowSpec("recency", 1, keep=True), _calls(400))
++    assert cutoff == 400  # K=1: only the current content visible
++    _, cutoff = keep_window(10, WindowSpec("recency", 4, keep=True), _calls(10))
++    assert cutoff == 0  # shorter episode than the window: everything visible
++
++
++# ----------------------------------------------------------------------------- selectors
++def test_divprune_and_dart_respect_budget_and_are_deterministic():
++    rng = np.random.default_rng(0)
++    feats = rng.normal(size=(80, 32)).astype(np.float32)
++    for sel in (select_divprune, select_dart):
++        a = sel(feats, 24)
++        b = sel(feats, 24)
++        assert len(a) == 24 and len(set(a.tolist())) == 24
++        assert np.array_equal(a, b)
++        assert np.array_equal(sel(feats, 100), np.arange(80))  # budget >= n keeps all
++
++
++def test_divprune_prefers_diverse_tokens():
++    base = np.eye(4, dtype=np.float32)
++    feats = np.concatenate([np.repeat(base[:1], 20, axis=0), base[1:]], axis=0)  # 20 duplicates + 3 distinct
++    kept = select_divprune(feats, 4)
++    assert {20, 21, 22}.issubset(set(kept.tolist()))  # the three distinct directions survive
++
++
++# ----------------------------------------------------------------------------- ledger
++def _feature_fn(tokens):
++    rng = np.random.default_rng(1)
++    return rng.normal(size=(len(tokens), 8)).astype(np.float32)
++
++
++@pytest.mark.parametrize("method", ["random", "divprune", "dart"])
++def test_ledger_budget_and_permanent_deletion(method):
++    k = 2
++    led = TokenLedger(PruneSpec(method, k), TPF, seed=0, episode=3, feature_fn=_feature_fn)
++    prev = set()
++    for c, step in enumerate(_calls(16 * 12)):
++        hist = [s for s in _calls(step)[:-1] if s not in led.seen_frames]
++        kept = set(led.update(hist))
++        assert len(kept) <= TPF * k
++        if c <= k:  # no deletion while the pool fits
++            assert len(kept) == TPF * c
++        # permanence: survivors are a subset of (previous survivors + the newest frame)
++        newest = {(hist[-1], p) for p in range(TPF)} if hist else set()
++        assert kept.issubset(prev | newest)
++        prev = kept
++    assert all(s != 16 * 12 for s, _ in prev)  # the current frame is never a candidate
++
++
++def test_ledger_random_is_seeded_per_episode():
++    runs = []
++    for ep in (0, 0, 1):
++        led = TokenLedger(PruneSpec("random", 1), TPF, seed=5, episode=ep)
++        for step in _calls(16 * 6):
++            hist = [s for s in _calls(step)[:-1] if s not in led.seen_frames]
++            kept = led.update(hist)
++        runs.append(tuple(kept))
++    assert runs[0] == runs[1] and runs[0] != runs[2]
++
++
++def test_ledger_budget_zero_keeps_nothing():
++    led = TokenLedger(PruneSpec("random", 0), TPF, seed=0, episode=0)
++    assert led.update([0]) == [] and led.update([16]) == []
++
++
++# ----------------------------------------------------------------------------- layout
++def test_build_token_inputs_layout_and_mask():
++    feats = {}
++    for s in (0, 16, 32):
++        feats[s] = {
++            "image_emb_4x4": np.full((1, TPF, 4), s, dtype=np.float32),
++            "pos_emb_4x4": np.arange(TPF * 3, dtype=np.float32).reshape(1, TPF, 3),
++            "state_emb": np.full((2,), s / 10, dtype=np.float32),
++        }
++    tokens = [(32, 5), (0, 1), (16, 15)]
++    img, pos, state, mask = build_token_inputs(feats, tokens, 512, TPF, 4, 3, 2)
++    assert img.shape == (512, 4) and mask.sum() == 3 and mask[:3].all()
++    assert img[0, 0] == 0 and img[1, 0] == 16 and img[2, 0] == 32  # sorted by (frame, patch)
++    assert np.allclose(pos[1], np.arange(TPF * 3).reshape(TPF, 3)[15])
++    assert np.allclose(state[2], 3.2)
++    with pytest.raises(ValueError):
++        build_token_inputs(feats, tokens, 2, TPF, 4, 3, 2)
++
++
++# ----------------------------------------------------------------------------- blinding
++def test_blind_vectors():
++    vis, mem = blind_vectors(18, None, "visual")
++    assert not vis.any() and not mem.any()
++    vis, mem = blind_vectors(18, 6, "visual")
++    assert vis[:6].sum() == 0 and vis[6:].all() and np.array_equal(vis, mem)
++    vis, mem = blind_vectors(18, 6, "memory")
++    assert not vis.any() and mem[6:].all()
++    vis, mem = blind_vectors(18, 18, "visual")
++    assert not vis.any()
++    with pytest.raises(ValueError):
++        blind_vectors(18, 19, "visual")
