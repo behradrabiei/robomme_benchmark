@@ -1,0 +1,323 @@
+diff --git a/robomme_sim/__init__.py b/robomme_sim/__init__.py
+index e998cb5..3c83188 100644
+--- a/robomme_sim/__init__.py
++++ b/robomme_sim/__init__.py
+@@ -1,6 +1,6 @@
+-
+-from robomme_sim._compat import apply_fla_torch_compat
++from robomme_sim._compat import apply_fla_torch_compat, apply_patch_embed_linear_compat
+ from robomme_sim._sapien_env import prepare_sapien_runtime
+ 
+ apply_fla_torch_compat()
++apply_patch_embed_linear_compat()
+ prepare_sapien_runtime()
+diff --git a/robomme_sim/_compat.py b/robomme_sim/_compat.py
+index ddc5e29..e4434cf 100644
+--- a/robomme_sim/_compat.py
++++ b/robomme_sim/_compat.py
+@@ -1,4 +1,4 @@
+ 
+-from simplememvla.compat import apply_fla_torch_compat
++from simplememvla.compat import apply_fla_torch_compat, apply_patch_embed_linear_compat
+ 
+-__all__ = ["apply_fla_torch_compat"]
++__all__ = ["apply_fla_torch_compat", "apply_patch_embed_linear_compat"]
+diff --git a/robomme_sim/eval_success.py b/robomme_sim/eval_success.py
+index ac493d4..82aac3c 100644
+--- a/robomme_sim/eval_success.py
++++ b/robomme_sim/eval_success.py
+@@ -9,6 +9,7 @@ import argparse
+ import importlib.util
+ import json
+ import os
++import time
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -96,6 +97,12 @@ def parse_args() -> argparse.Namespace:
+                          "1 -> one success + one failure example per task; 0 disables.")
+     ap.add_argument("--log_file", default=None,
+                     help="If set, results.json is placed next to this log path (logs/ convention).")
++    ap.add_argument("--seed", type=int, default=0,
++                    help="Seed for torch/numpy at the start of the run (local addition; upstream "
++                         "hard-codes 0, which stays the default).")
++    ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
++                    help="Local addition: skip episodes already recorded in episodes.jsonl next to "
++                         "results.json (same settings required). --no-resume starts the record afresh.")
+     return ap.parse_args()
+ 
+ 
+@@ -174,6 +181,90 @@ def build_policy(args):
+     return batched, buffer_factory, normalize_state
+ 
+ 
++def _episodes_log_path(args) -> str | None:
++    """episodes.jsonl next to results.json (local addition: per-episode progress record)."""
++    if getattr(args, "log_file", None):
++        return os.path.join(os.path.dirname(os.path.abspath(args.log_file)), "episodes.jsonl")
++    if getattr(args, "video_dir", None):
++        return os.path.join(args.video_dir, "episodes.jsonl")
++    return None
++
++
++# Settings that change an episode's outcome; a resumed run must match them exactly.
++_RESUME_KEYS = ("pretrained_checkpoint", "dataset_split", "execute_horizon", "max_steps",
++                "num_denoising_steps", "eval_temperature", "max_subtask_tokens", "pipelined",
++                "compute_dtype", "attn_implementation", "seed")
++
++
++def _run_config(args) -> dict:
++    cfg = {k: getattr(args, k, None) for k in _RESUME_KEYS}
++    cfg["pretrained_checkpoint"] = os.path.abspath(str(cfg["pretrained_checkpoint"]))
++    return cfg
++
++
++def _prepare_resume(args) -> None:
++    """Check or reset the on-disk record before any worker starts (main process only)."""
++    path = _episodes_log_path(args)
++    if not path:
++        return
++    cfg_path = os.path.join(os.path.dirname(path), "run_config.json")
++    cfg = _run_config(args)
++    if not getattr(args, "resume", True):
++        for stale in (path, cfg_path):
++            if os.path.isfile(stale):
++                os.remove(stale)
++    elif os.path.isfile(cfg_path):
++        with open(cfg_path) as f:
++            old = json.load(f)
++        diff = {k: (old.get(k), cfg[k]) for k in cfg if old.get(k) != cfg[k]}
++        if diff:
++            raise SystemExit(
++                f"[eval] refusing to resume into {os.path.dirname(path)}: settings differ from the "
++                f"recorded run (recorded, requested): {diff}. Use another run dir or --no-resume."
++            )
++    elif os.path.isfile(path):
++        raise SystemExit(
++            f"[eval] {path} exists without run_config.json, so its settings are unknown. "
++            "Use another run dir or --no-resume."
++        )
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(cfg_path, "w") as f:
++        json.dump(cfg, f, indent=2)
++
++
++def _load_recorded(args) -> dict[tuple[str, int], bool]:
++    """(task, episode) -> success for every episode already in episodes.jsonl."""
++    path = _episodes_log_path(args)
++    done: dict[tuple[str, int], bool] = {}
++    if not (path and getattr(args, "resume", True) and os.path.isfile(path)):
++        return done
++    with open(path) as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                rec = json.loads(line)
++            except json.JSONDecodeError:
++                continue  # a line cut short by the interruption: that episode is rerun
++            done[(str(rec["task"]), int(rec["episode"]))] = bool(rec["success"])
++    return done
++
++
++def _report_episode(args, record: dict) -> None:
++    print(f"[eval] {record['task']} ep{record['episode']}: {record['status']} "
++          f"steps={record['steps']} calls={record['n_calls']} "
++          f"({record['wall_s']:.0f}s since group start)", flush=True)
++    path = _episodes_log_path(args)
++    if path:
++        try:
++            os.makedirs(os.path.dirname(path), exist_ok=True)
++            with open(path, "a") as f:
++                f.write(json.dumps(record) + "\n")
++        except Exception as e:
++            print(f"[eval] WARNING: could not append to '{path}': {e}", flush=True)
++
++
+ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+               video_dir=None, video_quota=None):
+     G = len(specs)
+@@ -239,6 +330,19 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+               "are EXCLUDED from the success rate (None), not counted as failures.", flush=True)
+ 
+     success = [False] * G
++    steps = [0] * G
++    n_calls = [0] * G
++    status = ["ongoing"] * G
++    group_t0 = time.time()
++
++    def report(g):
++        _report_episode(args, {
++            "task": task, "episode": int(specs[g].get("episode", g)),
++            "success": bool(success[g]), "status": status[g],
++            "steps": int(steps[g]), "n_calls": int(n_calls[g]),
++            "seed": int(getattr(args, "seed", 0)),
++            "group_size": G, "wall_s": round(time.time() - group_t0, 1),
++        })
+ 
+     def _results():
+         return [success[g] if reset_ok[g] else None for g in range(G)]
+@@ -262,16 +366,21 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+         for k, g in enumerate(act):
+             actions_unnorm, _subtask = decisions[k]
+             action_chunks[g] = actions_unnorm[: args.execute_horizon]
++            n_calls[g] += 1
+ 
+         step_results = pool.step(action_chunks, act)
+         for g in act:
+             res = step_results[g]
+             if not isinstance(res, dict) or "error" in res:
+                 success[g] = False
++                status[g] = "error"
+                 if g in active:
+                     active.remove(g)
+                     save_video(g, ok=False)
++                    report(g)
+                 continue
++            steps[g] += int(res.get("consumed", len(res.get("frames", []))))
++            status[g] = str(res.get("status", "ongoing"))
+             for fr in res.get("frames", []):
+                 buffers[g].observe(to_full(fr))
+                 if recorders[g] is not None:
+@@ -282,9 +391,13 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+             if res.get("done", False) and g in active:
+                 active.remove(g)
+                 save_video(g, ok=success[g])
++                report(g)
+ 
+     for g in active:
++        if not success[g] and status[g] == "ongoing":
++            status[g] = "decision_cap"
+         save_video(g, ok=success[g])
++        report(g)
+ 
+     return _results()
+ 
+@@ -292,8 +405,10 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+ def evaluate_tasks(args, tasks) -> dict:
+     import gc
+ 
+-    torch.manual_seed(0)
+-    np.random.seed(0)
++    seed = int(getattr(args, "seed", 0))
++    torch.manual_seed(seed)
++    np.random.seed(seed)
++    recorded = _load_recorded(args)
+ 
+     n_req = int(args.episodes_per_task)
+     group_size = int(min(args.group_size, n_req))
+@@ -315,14 +430,16 @@ def evaluate_tasks(args, tasks) -> dict:
+                                       action_space="joint_angle", max_steps=args.max_steps)
+         return builder.get_episode_num()
+ 
+-    def build_specs(task, done, g):
+-        return [{"task": task, "episode": done + e} for e in range(g)]
++    def build_specs(task, episodes):
++        return [{"task": task, "episode": int(e)} for e in episodes]
+ 
+     video_root = getattr(args, "video_dir", None)
+     video_per_bucket = max(0, int(getattr(args, "video_max_per_task", 1) or 0))
+ 
+-    def run_group_oom_safe(task, done, g, video_quota=None):
+-        specs = build_specs(task, done, g)
++    def run_group_oom_safe(task, episodes, video_quota=None):
++        g = len(episodes)
++        done = episodes[0]
++        specs = build_specs(task, episodes)
+         vdir = os.path.join(video_root, task) if video_root else None
+         try:
+             return list(run_group(args, pool, batched, buffer_factory, normalize_state, task,
+@@ -338,8 +455,8 @@ def evaluate_tasks(args, tasks) -> dict:
+         half = g // 2
+         print(f"[eval] group {task}:{done} CUDA OOM at group={g} -- retrying as {half}+{g - half}.",
+               flush=True)
+-        left, _ = run_group_oom_safe(task, done, half, video_quota=video_quota)
+-        right, _ = run_group_oom_safe(task, done + half, g - half, video_quota=video_quota)
++        left, _ = run_group_oom_safe(task, episodes[:half], video_quota=video_quota)
++        right, _ = run_group_oom_safe(task, episodes[half:], video_quota=video_quota)
+         return left + right, True
+ 
+     per_task: dict[str, float | None] = {}
+@@ -358,20 +475,25 @@ def evaluate_tasks(args, tasks) -> dict:
+         if n < n_req:
+             print(f"[eval] {task}: split has only {n_avail} episodes (requested {n_req}) "
+                   f"-> evaluating {n}.", flush=True)
+-        successes = []
++        successes = [recorded[(task, e)] for e in range(n) if (task, e) in recorded]
++        pending = [e for e in range(n) if (task, e) not in recorded]
++        if successes:
++            print(f"[eval] {task}: resuming, {len(successes)}/{n} episodes already recorded "
++                  f"({int(sum(successes))} successes), {len(pending)} to run.", flush=True)
+         any_oom = False
+         done = 0
+         video_quota = ({"succ": video_per_bucket, "fail": video_per_bucket}
+                        if (video_root and video_per_bucket > 0) else None)
+-        while done < n:
+-            g = min(group_size, n - done)
++        while done < len(pending):
++            g = min(group_size, len(pending) - done)
+             try:
+-                grp_outcomes, oom = run_group_oom_safe(task, done, g, video_quota=video_quota)
++                grp_outcomes, oom = run_group_oom_safe(
++                    task, pending[done: done + g], video_quota=video_quota)
+                 successes.extend(s for s in grp_outcomes if s is not None)
+                 any_oom = any_oom or oom
+             except Exception as e:
+                 import traceback
+-                print(f"[eval] group {task}:{done} failed: {e}\n{traceback.format_exc()[:1200]}", flush=True)
++                print(f"[eval] group {task}:{pending[done]} failed: {e}\n{traceback.format_exc()[:1200]}", flush=True)
+             done += g
+         torch.cuda.empty_cache()
+         gc.collect()
+@@ -483,6 +605,7 @@ def main():
+     args = parse_args()
+     tasks = args.tasks if args.tasks else DEFAULT_TASKS
+     _validate_pipelined_horizon(args)
++    _prepare_resume(args)
+     print(f"[eval] split={args.dataset_split}, episodes_per_task<={args.episodes_per_task} "
+           f"(official frozen benchmark episodes; no seed search).", flush=True)
+ 
+diff --git a/simplememvla/compat.py b/simplememvla/compat.py
+index 6ba0ea9..dfa12d9 100644
+--- a/simplememvla/compat.py
++++ b/simplememvla/compat.py
+@@ -44,3 +44,38 @@ def _alias_submodules(pub) -> None:
+             continue
+         sys.modules[public_path] = module
+         setattr(pub, name, module)
++
++
++def apply_patch_embed_linear_compat() -> None:
++    """Run the Qwen3.5 vision patch embedding as a linear map instead of Conv3d.
++
++    Local fix (RTX 5090 env, torch 2.9.1+cu128): a bf16/fp16 ``nn.Conv3d`` *with a bias*
++    takes ~0.7 s for one 256x256 image (256 patches) on this torch, against ~6 ms without
++    the bias and ~0.02 ms as a linear layer, and the eval embeds several patches per
++    decision. The patch embedding has kernel == stride, so it is exactly a linear map over
++    the flattened (C, T, H, W) patch; outputs agree with the convolution to bf16 rounding.
++    Set SIMPLEMEMVLA_CONV3D_PATCH_EMBED=1 to keep the original convolution.
++    """
++    import os
++
++    if os.environ.get("SIMPLEMEMVLA_CONV3D_PATCH_EMBED", "0") not in ("", "0"):
++        return
++    try:
++        import torch.nn.functional as F
++        from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
++    except Exception:
++        return
++    cls = qwen.Qwen3_5VisionPatchEmbed
++    if getattr(cls, "_linear_patch_embed", False):
++        return
++
++    def forward(self, hidden_states):
++        proj = self.proj
++        patch_dim = (
++            self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
++        )
++        flat = hidden_states.reshape(-1, patch_dim).to(dtype=proj.weight.dtype)
++        return F.linear(flat, proj.weight.reshape(self.embed_dim, patch_dim), proj.bias)
++
++    cls.forward = forward
++    cls._linear_patch_embed = True
