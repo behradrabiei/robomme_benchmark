@@ -22,8 +22,34 @@ index ddc5e29..e4434cf 100644
  
 -__all__ = ["apply_fla_torch_compat"]
 +__all__ = ["apply_fla_torch_compat", "apply_patch_embed_linear_compat"]
+diff --git a/robomme_sim/batched_policy.py b/robomme_sim/batched_policy.py
+index 448b830..533c979 100644
+--- a/robomme_sim/batched_policy.py
++++ b/robomme_sim/batched_policy.py
+@@ -148,6 +148,11 @@ class BatchedEvalPolicy:
+             mm_token_type_ids=mmtt,
+         )
+ 
++        # Layer-depth ablation (local addition, off unless a blinder is attached by --blind_layer).
++        blinder = getattr(self, "visual_blinder", None)
++        if blinder is not None:
++            blinder.set_visual((iid == video_token_id) | (iid == image_token_id))
++
+         out = lm(
+             inputs_embeds=emb,
+             attention_mask=att,
+@@ -211,6 +216,9 @@ class BatchedEvalPolicy:
+             if all(row_done(i, step + 1) for i in range(N)):
+                 break
+ 
++        if blinder is not None:
++            blinder.clear()
++
+         if any(runaway):
+             print(
+                 f"[eval] WARNING: {sum(runaway)}/{N} row(s) hit the "
 diff --git a/robomme_sim/eval_success.py b/robomme_sim/eval_success.py
-index ac493d4..82aac3c 100644
+index ac493d4..a22c748 100644
 --- a/robomme_sim/eval_success.py
 +++ b/robomme_sim/eval_success.py
 @@ -9,6 +9,7 @@ import argparse
@@ -34,20 +60,58 @@ index ac493d4..82aac3c 100644
  from pathlib import Path
  
  import numpy as np
-@@ -96,6 +97,12 @@ def parse_args() -> argparse.Namespace:
+@@ -96,6 +97,20 @@ def parse_args() -> argparse.Namespace:
                           "1 -> one success + one failure example per task; 0 disables.")
      ap.add_argument("--log_file", default=None,
                      help="If set, results.json is placed next to this log path (logs/ convention).")
 +    ap.add_argument("--seed", type=int, default=0,
 +                    help="Seed for torch/numpy at the start of the run (local addition; upstream "
 +                         "hard-codes 0, which stays the default).")
++    ap.add_argument("--context_frames", type=int, default=None,
++                    help="Context-window ablation (local addition): show the model only the newest "
++                         "K sampled history frames, via its own history rule applied to a history "
++                         "that starts K frames ago. Unset = the unmodified model.")
++    ap.add_argument("--blind_layer", type=int, default=None,
++                    help="Layer-depth ablation (local addition): from this decoder layer (zero-based) "
++                         "on, no token can read the visual tokens (robomme_sim/layer_blind.py). "
++                         "Unset = the unmodified model.")
 +    ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
 +                    help="Local addition: skip episodes already recorded in episodes.jsonl next to "
 +                         "results.json (same settings required). --no-resume starts the record afresh.")
      return ap.parse_args()
  
  
-@@ -174,6 +181,90 @@ def build_policy(args):
+@@ -127,6 +142,10 @@ def build_policy(args):
+     )
+     device = next(vla.parameters()).device
+     if getattr(args, "pipelined", False):
++        if getattr(args, "context_frames", None) is not None:
++            raise SystemExit("[eval] --context_frames is not supported with --pipelined.")
++        if getattr(args, "blind_layer", None) is not None:
++            raise SystemExit("[eval] --blind_layer is not supported with --pipelined.")
+         from robomme_sim.pipelined_policy import PipelinedBufferPolicy, PipelinedEvalGroup
+ 
+         def buffer_factory():
+@@ -162,6 +181,12 @@ def build_policy(args):
+         num_denoising_steps=args.num_denoising_steps, eval_temperature=args.eval_temperature,
+         max_subtask_tokens=args.max_subtask_tokens, device=device,
+     )
++    if getattr(args, "blind_layer", None) is not None:
++        from robomme_sim.layer_blind import VisualBlinder
++
++        batched.visual_blinder = VisualBlinder(vla.backbone.model.language_model, args.blind_layer)
++        print(f"[eval] blind_layer={args.blind_layer}: visual tokens hidden from decoder layers "
++              f"{args.blind_layer}..{batched.visual_blinder.num_layers - 1}", flush=True)
+ 
+     def buffer_factory():
+         return RoboMMEPolicy(
+@@ -169,11 +194,96 @@ def build_policy(args):
+             unnormalize_action=unnormalize_action, normalize_state=normalize_state,
+             num_denoising_steps=args.num_denoising_steps, temperature=args.eval_temperature,
+             max_subtask_tokens=args.max_subtask_tokens,
++            context_frames=getattr(args, "context_frames", None),
+         )
+ 
      return batched, buffer_factory, normalize_state
  
  
@@ -63,7 +127,7 @@ index ac493d4..82aac3c 100644
 +# Settings that change an episode's outcome; a resumed run must match them exactly.
 +_RESUME_KEYS = ("pretrained_checkpoint", "dataset_split", "execute_horizon", "max_steps",
 +                "num_denoising_steps", "eval_temperature", "max_subtask_tokens", "pipelined",
-+                "compute_dtype", "attn_implementation", "seed")
++                "compute_dtype", "attn_implementation", "seed", "context_frames", "blind_layer")
 +
 +
 +def _run_config(args) -> dict:
@@ -138,12 +202,14 @@ index ac493d4..82aac3c 100644
  def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
                video_dir=None, video_quota=None):
      G = len(specs)
-@@ -239,6 +330,19 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+@@ -239,6 +349,24 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
                "are EXCLUDED from the success rate (None), not counted as failures.", flush=True)
  
      success = [False] * G
 +    steps = [0] * G
 +    n_calls = [0] * G
++    hist_age = [0] * G       # audit: oldest history frame shown, in steps before the current one
++    hist_distinct = [0] * G  # audit: most distinct history frames shown at one decision
 +    status = ["ongoing"] * G
 +    group_t0 = time.time()
 +
@@ -153,12 +219,27 @@ index ac493d4..82aac3c 100644
 +            "success": bool(success[g]), "status": status[g],
 +            "steps": int(steps[g]), "n_calls": int(n_calls[g]),
 +            "seed": int(getattr(args, "seed", 0)),
++            "context_frames": getattr(args, "context_frames", None),
++            "blind_layer": getattr(args, "blind_layer", None),
++            "max_history_age_steps": int(hist_age[g]), "max_history_frames": int(hist_distinct[g]),
 +            "group_size": G, "wall_s": round(time.time() - group_t0, 1),
 +        })
  
      def _results():
          return [success[g] if reset_ok[g] else None for g in range(G)]
-@@ -262,16 +366,21 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+@@ -255,6 +383,11 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+         if not act:
+             break
+         processed_list = [buffers[g]._prepare_inputs(instructions[g]) for g in act]
++        for k, g in enumerate(act):
++            shown = {i for _tag, ga, gb in processed_list[k]["video_patch_keys"] for i in (ga, gb)}
++            cur_idx = buffers[g]._frames_seen[buffers[g].history_image_keys[0]] - 1
++            hist_age[g] = max(hist_age[g], cur_idx - min(shown))
++            hist_distinct[g] = max(hist_distinct[g], len(shown))
+         state_list = [state_norm(cur_state[g]) for g in act]
+         decisions = batched.generate_batch(processed_list, state_list)
+ 
+@@ -262,16 +395,21 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
          for k, g in enumerate(act):
              actions_unnorm, _subtask = decisions[k]
              action_chunks[g] = actions_unnorm[: args.execute_horizon]
@@ -180,7 +261,7 @@ index ac493d4..82aac3c 100644
              for fr in res.get("frames", []):
                  buffers[g].observe(to_full(fr))
                  if recorders[g] is not None:
-@@ -282,9 +391,13 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+@@ -282,9 +420,13 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
              if res.get("done", False) and g in active:
                  active.remove(g)
                  save_video(g, ok=success[g])
@@ -194,7 +275,7 @@ index ac493d4..82aac3c 100644
  
      return _results()
  
-@@ -292,8 +405,10 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
+@@ -292,8 +434,10 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
  def evaluate_tasks(args, tasks) -> dict:
      import gc
  
@@ -207,7 +288,7 @@ index ac493d4..82aac3c 100644
  
      n_req = int(args.episodes_per_task)
      group_size = int(min(args.group_size, n_req))
-@@ -315,14 +430,16 @@ def evaluate_tasks(args, tasks) -> dict:
+@@ -315,14 +459,16 @@ def evaluate_tasks(args, tasks) -> dict:
                                        action_space="joint_angle", max_steps=args.max_steps)
          return builder.get_episode_num()
  
@@ -228,7 +309,7 @@ index ac493d4..82aac3c 100644
          vdir = os.path.join(video_root, task) if video_root else None
          try:
              return list(run_group(args, pool, batched, buffer_factory, normalize_state, task,
-@@ -338,8 +455,8 @@ def evaluate_tasks(args, tasks) -> dict:
+@@ -338,8 +484,8 @@ def evaluate_tasks(args, tasks) -> dict:
          half = g // 2
          print(f"[eval] group {task}:{done} CUDA OOM at group={g} -- retrying as {half}+{g - half}.",
                flush=True)
@@ -239,7 +320,7 @@ index ac493d4..82aac3c 100644
          return left + right, True
  
      per_task: dict[str, float | None] = {}
-@@ -358,20 +475,25 @@ def evaluate_tasks(args, tasks) -> dict:
+@@ -358,20 +504,25 @@ def evaluate_tasks(args, tasks) -> dict:
          if n < n_req:
              print(f"[eval] {task}: split has only {n_avail} episodes (requested {n_req}) "
                    f"-> evaluating {n}.", flush=True)
@@ -270,7 +351,7 @@ index ac493d4..82aac3c 100644
              done += g
          torch.cuda.empty_cache()
          gc.collect()
-@@ -483,6 +605,7 @@ def main():
+@@ -483,6 +634,7 @@ def main():
      args = parse_args()
      tasks = args.tasks if args.tasks else DEFAULT_TASKS
      _validate_pipelined_horizon(args)
@@ -278,6 +359,196 @@ index ac493d4..82aac3c 100644
      print(f"[eval] split={args.dataset_split}, episodes_per_task<={args.episodes_per_task} "
            f"(official frozen benchmark episodes; no seed search).", flush=True)
  
+diff --git a/robomme_sim/layer_blind.py b/robomme_sim/layer_blind.py
+new file mode 100644
+index 0000000..599aa17
+--- /dev/null
++++ b/robomme_sim/layer_blind.py
+@@ -0,0 +1,121 @@
++"""Layer-depth ablation (local addition): hide the visual tokens from decoder layer L on.
++
++From layer ``L`` (zero-based) to the last layer, no token can read a visual token (the history
++video patches and the current wrist image); layers below ``L`` run unchanged and positions never
++move. The Qwen3.5 text decoder alternates two token mixers, so "cannot read" has two forms:
++
++* ``full_attention`` layers (every 4th: 3, 7, ..., 31): the visual tokens' key columns are closed
++  for every query, on the prompt prefill and on every decode step.
++* ``linear_attention`` layers (gated delta rule, a recurrence with a 4-tap causal convolution): the
++  layer runs on the sequence with the visual positions removed, so they neither write to the
++  recurrent state, nor decay it, nor enter the convolution of the tokens after them.
++
++The DiT action head reads only the last-layer states of the generated sub-task tokens (plus
++proprioception), so nothing else needs hiding. ``L = num_layers`` hides nothing; nothing is
++installed unless a blinder is constructed, and an installed blinder with no visual mask set is a
++pass-through.
++"""
++from __future__ import annotations
++
++import torch
++
++
++class VisualBlinder:
++    def __init__(self, language_model, layer_start: int):
++        layers = language_model.layers
++        self.num_layers = len(layers)
++        self.layer_start = int(layer_start)
++        if not 0 <= self.layer_start <= self.num_layers:
++            raise ValueError(f"blind layer must be in [0, {self.num_layers}], got {layer_start}")
++        self._visual: torch.Tensor | None = None  # (batch, prompt_len) bool, True = visual token
++        self._keep_idx: torch.Tensor | None = None  # (batch, n_keep) prompt positions that stay
++        self.calls = {"full_attention": 0, "linear_attention": 0}
++        self._wrapped = [layers[i] for i in range(self.layer_start, self.num_layers)]
++        for layer in self._wrapped:
++            self._wrap(layer)
++
++    def remove(self) -> None:
++        """Restore the layers' own forward (used by the checks)."""
++        for layer in self._wrapped:
++            layer.__dict__.pop("forward", None)
++        self._wrapped = []
++        self.clear()
++
++    # -- per-decision state -------------------------------------------------------------------
++    def set_visual(self, visual: torch.Tensor) -> None:
++        """``visual``: (batch, prompt_len) bool over the (left-padded) prompt of this decision."""
++        visual = visual.bool()
++        counts = (~visual).sum(-1)
++        if not bool((counts == counts[0]).all()):
++            raise RuntimeError("rows keep different numbers of tokens; cannot compact the batch")
++        self._visual = visual
++        self._keep_idx = (~visual).nonzero(as_tuple=True)[1].view(visual.shape[0], -1)
++
++    def clear(self) -> None:
++        self._visual = None
++        self._keep_idx = None
++
++    # -- hooks --------------------------------------------------------------------------------
++    def _wrap(self, layer) -> None:
++        orig = layer.forward
++        kind = layer.block_type
++
++        def forward(hidden_states, *args, **kwargs):
++            if self._visual is None:
++                return orig(hidden_states, *args, **kwargs)
++            if args:
++                raise RuntimeError("layer-blind hook expects keyword arguments after hidden_states")
++            self.calls[kind] += 1
++            if kind == "full_attention":
++                kwargs["attention_mask"] = self._close_columns(
++                    kwargs.get("attention_mask"), hidden_states, layer, kwargs.get("past_key_values"))
++                return orig(hidden_states, **kwargs)
++            return self._skip_visual(orig, hidden_states, kwargs)
++
++        layer.forward = forward
++
++    def _close_columns(self, mask, hidden_states, layer, cache):
++        batch, q_len, _ = hidden_states.shape
++        prompt_len = self._visual.shape[1]
++        if mask is not None:
++            k_len = mask.shape[-1]
++        elif q_len == prompt_len:
++            k_len = prompt_len
++        else:
++            k_len = cache.layers[layer.self_attn.layer_idx].keys.shape[-2] + q_len
++        if k_len < prompt_len:
++            raise RuntimeError(f"attention over {k_len} keys but the prompt has {prompt_len}")
++        closed = torch.zeros(batch, k_len, dtype=torch.bool, device=hidden_states.device)
++        closed[:, :prompt_len] = self._visual
++        closed = closed[:, None, None, :]
++        if mask is None:
++            if q_len == 1:
++                base = torch.ones(1, 1, 1, k_len, dtype=torch.bool, device=hidden_states.device)
++            elif q_len == k_len:
++                base = torch.ones(q_len, k_len, dtype=torch.bool, device=hidden_states.device).tril()[None, None]
++            else:
++                raise RuntimeError("cannot rebuild a causal mask for a chunked continuation")
++            return base & ~closed
++        if mask.dim() != 4:
++            raise RuntimeError(f"expected a 4D attention mask, got {tuple(mask.shape)}")
++        if mask.dtype == torch.bool:
++            return mask & ~closed
++        return mask.masked_fill(closed, torch.finfo(mask.dtype).min)
++
++    def _skip_visual(self, orig, hidden_states, kwargs):
++        q_len = hidden_states.shape[1]
++        if q_len == 1:  # a decode step: the new token is text, the states already skip the visuals
++            return orig(hidden_states, **kwargs)
++        if q_len != self._visual.shape[1]:
++            raise RuntimeError("layer-blind hook supports a full-prompt prefill and 1-token decode steps")
++        idx = self._keep_idx
++        gather = idx[:, :, None].expand(-1, -1, hidden_states.shape[-1])
++        mask = kwargs.get("attention_mask")
++        if mask is not None:
++            if mask.dim() != 2 or mask.shape[1] != q_len:
++                raise RuntimeError(f"expected a (batch, seq) recurrent mask, got {tuple(mask.shape)}")
++            kwargs["attention_mask"] = mask.gather(1, idx)
++        kwargs["position_embeddings"] = None  # unused by the recurrent mixer; lengths would not match
++        kwargs["position_ids"] = None
++        out = orig(hidden_states.gather(1, gather), **kwargs)
++        return hidden_states.scatter(1, gather, out)  # visual rows keep their input; nothing reads them
+diff --git a/robomme_sim/policy.py b/robomme_sim/policy.py
+index 4111321..a979b08 100644
+--- a/robomme_sim/policy.py
++++ b/robomme_sim/policy.py
+@@ -116,6 +116,28 @@ def _token_id(processor: AutoProcessor, token: str) -> int:
+     raise ValueError(f"Tokenizer does not define required token {token!r}")
+ 
+ 
++def native_history_positions(cur: int, n: int, stride: int, variable_history: bool) -> list[int]:
++    """The model's own history rule (same arithmetic as RoboMMEPolicy._history_positions)."""
++    if variable_history:
++        avail = cur // stride + 1
++        m = variable_history_frames(avail)
++        return [max(0, cur - (m - 1 - i) * stride) for i in range(m)]
++    offsets = [-(n - 1 - i) * stride for i in range(n)] if n > 1 else [0]
++    return [max(0, cur + off) for off in offsets]
++
++
++def windowed_history_positions(
++    cur: int, n: int, stride: int, variable_history: bool, context_frames: int
++) -> list[int]:
++    """Context window of K frames: the native rule on a history that starts K frames ago.
++
++    The buffer is treated as if its first frame were ``lo = cur - (K - 1) * stride``, so the
++    model input is what the unmodified policy produces for an episode that began there.
++    """
++    lo = max(0, cur - (int(context_frames) - 1) * stride)
++    return [lo + p for p in native_history_positions(cur - lo, n, stride, variable_history)]
++
++
+ class RoboMMEPolicy:
+ 
+     def __init__(
+@@ -127,12 +149,18 @@ class RoboMMEPolicy:
+         num_denoising_steps: int = 10,
+         temperature: float = 1.0,
+         max_subtask_tokens: int = 64,
++        context_frames: int | None = None,
+     ):
+         if vla.config.control_frequency_hz is None:
+             raise ValueError(
+                 "Checkpoint config is missing control_frequency_hz; cannot rebuild "
+                 "the embodiment prompt."
+             )
++        # Context-window ablation (local addition; None = the unmodified model): the history
++        # rule below is applied to a buffer that starts (context_frames - 1) sampled frames ago.
++        if context_frames is not None and int(context_frames) < 1:
++            raise ValueError("context_frames must be >= 1")
++        self.context_frames = None if context_frames is None else int(context_frames)
+         self.vla = vla
+         self.processor = processor
+         self.unnormalize = unnormalize_action
+@@ -217,6 +245,10 @@ class RoboMMEPolicy:
+         cur = len(buf) - 1
+         if cur < 0:
+             raise RuntimeError("call observe() before predict()")
++        if self.context_frames is not None:
++            return windowed_history_positions(
++                cur, self.n_frames, self.stride, self.variable_history, self.context_frames
++            )
+         n, stride = self.n_frames, self.stride
+         if self.variable_history:
+             avail = cur // stride + 1
 diff --git a/simplememvla/compat.py b/simplememvla/compat.py
 index 6ba0ea9..dfa12d9 100644
 --- a/simplememvla/compat.py

@@ -114,7 +114,8 @@ uv pip install -p $PY --no-deps flash-linear-attention==0.2.2 && uv pip install 
 
 ## Local changes in the policy repo (branch `local`, copy in `patches/simplememvla_local.diff`)
 
-None of them touches the model or its sampling; the model-side files are upstream's.
+With the default options none of them touches the model or its sampling; the model-side files are
+upstream's. Items 5 and 6 are ablation options that are off unless set.
 
 1. **Linear patch embedding** (`simplememvla/compat.py: apply_patch_embed_linear_compat`, called from
    `robomme_sim/__init__.py`). On torch 2.9.1 a bf16 `nn.Conv3d` with a bias takes ~700 ms for the
@@ -135,6 +136,12 @@ None of them touches the model or its sampling; the model-side files are upstrea
    refuses different ones; `--no-resume` starts the record afresh. Limitation, inherited from
    upstream's single global random stream: a resumed process starts that stream again, so the remaining
    episodes do not get the action noise an uninterrupted run would have given them.
+5. **Context-window ablation** (`--context_frames K`, `CONTEXT_FRAMES=K` in the run script;
+   `robomme_sim/policy.py`): the model's own history rule applied to a history that starts
+   (K−1)·10 steps ago. Unset = upstream path. Recorded per episode and in the resume guard.
+6. **Layer-depth ablation** (`--blind_layer L`, `BLIND_LAYER=L`; `robomme_sim/layer_blind.py`, two
+   guarded lines in `robomme_sim/batched_policy.py`): from decoder layer L on no token reads a visual
+   token. Unset = no hook installed. Not available with `--pipelined`.
 
 ## Checks run (seed 0 = upstream default, sdpa, non-pipelined, execute_horizon 16)
 

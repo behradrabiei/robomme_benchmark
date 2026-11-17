@@ -19,8 +19,13 @@
 # extra args are then its options, e.g.  EVAL=plus ./run_simplememvla_eval.sh \
 #   --tasks BinFill --episodes 0 --output-dir /mnt/vault/robomme/runs/simplememvla/plus-smoke
 #
+# CONTEXT_FRAMES=K (context-window ablation): the model sees only the newest K sampled history
+# frames, through its own history rule applied to a history that starts K frames ago. Unset = the
+# unmodified model.
+# BLIND_LAYER=L (layer-depth ablation): from decoder layer L (zero-based, 32 layers) on, no token can
+# read the visual tokens (robomme_sim/layer_blind.py). Unset = the unmodified model.
 # Env overrides: CHECKPOINT GPU SEED TASKS EPISODES_PER_TASK GROUP_SIZE RUN_TAG RUN_DIR SAVE_DIR
-# ATTN_IMPLEMENTATION, plus every variable upstream's scripts/eval_robomme.sh reads
+# ATTN_IMPLEMENTATION CONTEXT_FRAMES BLIND_LAYER, plus every variable upstream's scripts/eval_robomme.sh reads
 # (MAX_STEPS, EXECUTE_HORIZON, PIPELINED, VIDEO_MAX_PER_TASK, ...).
 # The env runs torch 2.9.1+cu128 (upstream pins 2.4.1, which has no RTX 5090 kernels), so
 # flash-attn is not installed and attention defaults to sdpa; the vision patch embedding runs as
@@ -56,5 +61,10 @@ else
   export PYBIN CHECKPOINT GPU ATTN_IMPLEMENTATION
   export NUM_GPUS=1 GROUP_SIZE="${GROUP_SIZE:-2}"
   echo "[eval] checkpoint=$CHECKPOINT seed=$SEED tasks=${TASKS:-<all 16>} episodes/task=${EPISODES_PER_TASK:-50} group=$GROUP_SIZE attn=$ATTN_IMPLEMENTATION"
-  exec bash "$POLICY_REPO/scripts/eval_robomme.sh" --seed "$SEED" "$@"
+  CTX_ARGS=()
+  [[ -n "${CONTEXT_FRAMES:-}" ]] && CTX_ARGS=(--context_frames "$CONTEXT_FRAMES")
+  [[ -n "${CONTEXT_FRAMES:-}" ]] && echo "[eval] context_frames=$CONTEXT_FRAMES"
+  [[ -n "${BLIND_LAYER:-}" ]] && CTX_ARGS+=(--blind_layer "$BLIND_LAYER")
+  [[ -n "${BLIND_LAYER:-}" ]] && echo "[eval] blind_layer=$BLIND_LAYER"
+  exec bash "$POLICY_REPO/scripts/eval_robomme.sh" --seed "$SEED" "${CTX_ARGS[@]}" "$@"
 fi
